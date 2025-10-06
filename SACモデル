@@ -1,0 +1,226 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import Dict, Any, List
+
+# --- 1. ハイパーパラメーター設定 
+
+@dataclass
+class HyperparameterConfig:
+    """
+    SAC/DDPGなどのDRLエージェントの主要ハイパーパラメーター設定。
+    ベイズ最適化によって特定
+    """
+    algorithm: str = "SAC (Soft Actor-Critic)"
+
+    # 再現性確保のためのシード分離
+    random_seed_tuning: int = 42 # チューニングに使用したランダムシード
+    random_seed_test_start: int = 100 # 最終評価に使用するシードの開始値
+    num_evaluation_seeds: int = 20    # 評価に使用するシード数 (ロバスト性評価用) [2]
+
+    # --- 最適化された主要ハイパーパラメーター
+    learning_rate_actor: float = 9.3e-4  # 探索範囲: 1e-5 – 1e-3 [5]
+    learning_rate_critic: float = 1.5e-3 # EGO/Bayesian Optimizationで特定
+    discount_factor: float = 0.974       # 割引率 (gamma): 中長期的な報酬を重視 [5]
+    batch_size: int = 512                # ミニバッチサイズ
+    replay_buffer_size: int = 500000     # 経験再生バッファサイズ
+    target_update_rate: float = 0.005    # ターゲットネットワーク更新率 (tau)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """設定を辞書形式で返す"""
+        return self.__dict__
+
+OPTIMAL_CONFIG = HyperparameterConfig()
+
+# --- 2. データ集計と評価指標の計算 
+# 複数シードの結果を集約し、平均と標準偏差を計算
+
+def create_dummy_data(num_seeds: int, num_steps: int) -> List:
+    """
+    複数のランダムシードによるDRL学習結果 (ステップ数 vs 報酬) をシミュレート
+    実際の環境では、各シードの結果をCSVファイルからロードすることを想定
+    """
+    all_dfs = []
+    steps = np.arange(0, num_steps * 100, 100) # 0から100ステップごとにデータ点を生成
+
+    for i in range(num_seeds):
+        # シードごとに異なるノイズを持つ学習曲線をシミュレート
+        np.random.seed(OPTIMAL_CONFIG.random_seed_test_start + i)
+
+        # 累積報酬が最大値 (1.0) に収束する傾向をシミュレート
+        mean_convergence = 0.9 * (1 - np.exp(-steps / 3000))
+        # ランダムノイズとサイン波ノイズを追加して、学習の「不安定さ」を表現
+        reward_data = (mean_convergence + 0.05 * np.random.randn(len(steps)) +
+                       0.05 * np.sin(steps / 1500))
+
+        # 報酬を0から1.0の間にクリップ (正規化された報酬の想定)
+        reward_data = np.clip(reward_data, a_min=0, a_max=1.0)
+
+        df = pd.DataFrame({'Step': steps, 'Reward': reward_data})
+        df['Seed'] = i + 1
+        all_dfs.append(df)
+
+    return all_dfs
+
+def load_and_aggregate_results(list_of_dfs: List) -> pd.DataFrame:
+    """
+    シミュレーションされたデータフレームのリストを受け取り、ステップ数ごとに平均報酬と
+    標準偏差を計算して集約
+    """
+    # 最初のデータフレームをベースにし、残りをマージ
+    combined_df = list_of_dfs[0].rename(columns={'Reward': 'Reward_Seed_1'}).drop(columns=['Seed'])
+
+    for i, df_seed in enumerate(list_of_dfs[1:], start=2):
+        col_name = f'Reward_Seed_{i}'
+        df_seed_renamed = df_seed.rename(columns={'Reward': col_name}).drop(columns=['Seed'])
+        combined_df = combined_df.merge(df_seed_renamed, on='Step', how='outer')
+
+    # --- Idiomatic Pandas Method Chainingによる集計処理 [6, 7] ---
+    aggregated_results = (
+        combined_df.set_index('Step')
+        # 報酬の列のみをフィルタリング
+       .filter(regex='Reward_Seed_')
+        # 複数の軸 (列) にわたる統計量を一度に計算
+       .pipe(lambda df: pd.DataFrame({
+            'Mean_Reward': df.mean(axis=1),
+            # 標準偏差 (SD) を使用して、ポリシーの変動性 (ロバスト性) を示す [8, 9]
+            'Std_Reward': df.std(axis=1),
+        }))
+       .assign(
+            Upper_Bound=lambda df: df['Mean_Reward'] + df['Std_Reward'],
+            Lower_Bound=lambda df: df['Mean_Reward'] - df['Std_Reward']
+        )
+       .reset_index()
+    )
+
+    return aggregated_results
+
+# --- 3. 科学的な可視化 
+# Tufteの原則 [10] や科学報告書の標準 [3] に従い、プロットを生成
+
+def plot_drl_training_curve(df: pd.DataFrame, config: HyperparameterConfig, target_value: float = 0.95):
+    """
+    DRLエージェントの学習曲線（累積報酬）を、信頼区間（±SD）付きでプロット
+    """
+    # プロットに適したスタイル設定
+    plt.style.use('seaborn-v0_8-whitegrid')
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # 1. 平均曲線 (メインデータ)
+    line, = ax.plot(df['Step'], df['Mean_Reward'],
+                    label=f'Average Reward ({config.num_evaluation_seeds} seeds)',
+                    color='#1192e8', linewidth=2) # IBM Carbon Design Cyan 50 [11]
+
+    # 2. 安定性の表示: 標準偏差 (±SD) の範囲をシェードで表示 [12]
+    ax.fill_between(df['Step'], df['Lower_Bound'], df['Upper_Bound'],
+                    alpha=0.25, color=line.get_color(),
+                    label='Policy Variability ($\pm 1$ SD)')
+
+    # 3.　最大化目標の追加
+    ax.axhline(target_value, color='r', linestyle='--', linewidth=1.5, alpha=0.7,
+               label=f'Optimization Target ({target_value*100:.0f}% Normalized)')
+
+    # --- ラベルとタイトル --- [3, 13]
+    ax.set_title(f"{config.algorithm} Learning Curve: Performance and Stability Analysis",
+                 fontsize=14, pad=20)
+    ax.set_xlabel("Total Environment Interaction Steps", fontsize=12)
+    ax.set_ylabel("Normalized Cumulative Reward (AU)", fontsize=12)
+    ax.set_ylim(0, 1.1)
+
+    # Tufteの原則: 不必要な枠線を非表示にし、データインク比を最大化 [10, 14]
+    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(False)
+
+    ax.legend(loc='lower right', frameon=True)
+    plt.tight_layout()
+    plt.show()
+
+def plot_final_yield_comparison(drl_yields: np.ndarray, baseline_yield: float, baseline_std: float):
+    """
+    最終評価指標（収率）の比較棒グラフをプロット
+    エラーバー (±SD) を含めることで、DRLポリシーのロバスト性の優位性を示す [3]
+    """
+    mean_drl_yield = np.mean(drl_yields)
+    std_drl_yield = np.std(drl_yields)
+
+    labels = ['DRL Policy', 'Baseline (CMA-ES)']
+    means = [mean_drl_yield * 100, baseline_yield * 100]
+    stds = [std_drl_yield * 100, baseline_std * 100]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    # IBM Carbon Design のアクセシブルな色を使用 [11]
+    colors = ['#005d5d', '#8a3800'] # Teal 70 (DRL) vs Orange 70 (Baseline)
+
+    # 棒グラフの描画 (エラーバー付き)
+    bars = ax.bar(labels, means, yerr=stds, capsize=10,
+                  color=colors, alpha=0.8, ecolor='black', linewidth=1.5)
+
+    # ラベルとタイトルの設定 [3]
+    ax.set_title("Evaluation Metric Comparison: Final Product Yield", fontsize=14)
+    ax.set_ylabel("Final Yield (%)", fontsize=12, labelpad=10)
+    ax.set_ylim(80, 100)
+
+    # エラーバーの定義を明記
+    ax.text(0.5, 0.98, "Error bars represent $\pm 1$ Standard Deviation (SD)",
+            transform=ax.transAxes, horizontalalignment='center',
+            fontsize=9, color='gray')
+
+    # データ値の表示
+    for bar, mean, std in zip(bars, means, stds):
+        ax.text(bar.get_x() + bar.get_width() / 2, mean + std + 1,
+                f"{mean:.1f}%", ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    # Tufteの原則: スパインを非表示 [14]
+    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(False)
+
+    plt.tight_layout()
+    plt.show()
+
+# --- 4. メイン実行ブロック ---
+
+if __name__ == "__main__":
+
+    print(f"--- 1. {OPTIMAL_CONFIG.algorithm} ハイパーパラメーター設定 ---")
+    for key, value in OPTIMAL_CONFIG.to_dict().items():
+        print(f"| {key.ljust(25)} | {value}")
+    print("-" * 50)
+
+    # シミュレーションデータの生成 (ステップ数10000まで、20シードを使用)
+    SIMULATED_DATA_FRAMES = create_dummy_data(
+        num_seeds=OPTIMAL_CONFIG.num_evaluation_seeds,
+        num_steps=100
+    )
+
+    print(f"--- 2. {OPTIMAL_CONFIG.num_evaluation_seeds} シードの結果を集計中 ---")
+    aggregated_df = load_and_aggregate_results(SIMULATED_DATA_FRAMES)
+    print("集計結果 (最初の5ステップ):")
+    print(aggregated_df.head())
+    print("-" * 50)
+
+    # 3. 学習曲線のプロット 
+    plot_drl_training_curve(
+        df=aggregated_df,
+        config=OPTIMAL_CONFIG,
+        target_value=0.95 # DRLレポートの目標累積報酬
+    )
+
+    # 4. 最終評価指標の比較プロット 
+    # レポートの表5.2に基づく仮想データを使用
+    # DRLポリシーの収率 (平均92.5%, SD 1.2%) をシミュレート
+    np.random.seed(42)
+    FINAL_DRL_YIELDS = np.random.normal(loc=0.925, scale=0.012, size=OPTIMAL_CONFIG.num_evaluation_seeds)
+    FINAL_DRL_YIELDS = np.clip(FINAL_DRL_YIELDS, 0.85, 0.95) # 収束範囲を制限
+
+    # ベースライン (CMA-ES): 平均85.0%, SD 3.5% [15]
+    BASELINE_YIELD = 0.85
+    BASELINE_STD = 0.035
+
+    plot_final_yield_comparison(
+        drl_yields=FINAL_DRL_YIELDS,
+        baseline_yield=BASELINE_YIELD,
+        baseline_std=BASELINE_STD
+    )
