@@ -21,11 +21,11 @@ class SaponificationEnv:
         self.state_space_low = np.array([50., 10.])   # 温度, 時間の下限
         self.state_space_high = np.array([150., 60.]) # 温度, 時間の上限
 
-        # 行動：[温度変化(℃), 時間変化(min)]
+# 行動：[温度変化(℃), 時間変化(min)]
         self.action_space_low = np.array([-10., -5.])
         self.action_space_high = np.array([10., 5.])
 
-        # 最適条件
+# 最適条件
         self._optimal_temp = 115.
         self._optimal_time = 35.
 
@@ -36,24 +36,24 @@ class SaponificationEnv:
 
     def step(self, action):
         """行動を取り、次の状態と報酬を返す"""
-        # 行動をクリップして範囲内に収める
+# 行動をクリップして範囲内に収める
         action = np.clip(action, self.action_space_low, self.action_space_high)
 
-        # 次の状態を計算
+ # 次の状態を計算
         self.state = np.clip(self.state + action, self.state_space_low, self.state_space_high)
 
-        # 報酬（収率）を計算
+ # 報酬（収率）を計算
         temp, time = self.state
 
-        # 最適条件からの距離に基づいて収率（報酬）を決定
-        # ガウス関数を用いて、最適点で収率が最大(約100%)になるように設定
+ # 最適条件からの距離に基づいて収率（報酬）を決定
+ # ガウス関数を用いて、最適点で収率が最大(約100%)になるように設定
         temp_diff = (temp - self._optimal_temp)**2
         time_diff = (time - self._optimal_time)**2
 
-        # 収率を報酬として返す（マイナスの値なので、0に近いほど良い）
+  # 収率を報酬として返す（マイナスの値なので、0に近いほど良い）
         reward = - (0.005 * temp_diff + 0.02 * time_diff) + np.random.normal(0, 0.01) # ノイズを追加
 
-        # この簡易環境では常に False
+  # この簡易環境では常に False
         done = False
 
         return self.state, reward, done
@@ -174,13 +174,13 @@ obs = env.reset() # 実験の初期条件をリセット
 
 for i in tqdm(range(200)): # 200回の実験（試行錯誤）をシミュレート
 
-    # RSで次に試すべき最良の行動を決定
+ # RSで次に試すべき最良の行動を決定
     best_action = random_shooting(obs)
 
-    # 決定された行動を環境（実験）で実行
+# 決定された行動を環境（実験）で実行
     next_obs, reward, _ = env.step(best_action)
 
-    # 結果を記録
+# 結果を記録
     data_buffer.append((obs, act, next_obs))
     if len(data_buffer) > buffer_size:
         data_buffer.pop(0)
@@ -190,7 +190,7 @@ for i in tqdm(range(200)): # 200回の実験（試行錯誤）をシミュレー
 
     obs = next_obs
 
-    # 5回ごとにダイナミクスモデルを再学習して精度を上げる
+# 5回ごとにダイナミクスモデルを再学習して精度を上げる
     if i % 5 == 0 and len(data_buffer) > 128:
         indices = np.random.choice(len(data_buffer), 128)
         samples = [data_buffer[i] for i in indices]
